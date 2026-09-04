@@ -1290,16 +1290,27 @@ export class Container<Env = Cloudflare.Env> extends DurableObject<Env> {
         return new Response(null, { status: res.status, webSocket: client, headers: res.headers });
       }
 
-      if (res.body !== null) {
-        const { readable, writable } = new IdentityTransformStream();
-        res.body?.pipeTo(writable).finally(() => {
-          this.decrementInflight();
-        });
+      // A response is no longer in flight once the container has answered. Waiting for the body
+      // to finish would pin `inflightRequests` above zero whenever nobody reads it, since the
+      // stream stalls on backpressure. Bytes flowing through the body renew the timeout below.
+      // WebSockets keep the pin until close because the runtime guarantees a close/error event.
+      // Body completion has no such guarantee.
+      this.decrementInflight();
 
-        return new Response(readable, res);
+      if (res.body !== null) {
+        return new Response(
+          res.body.pipeThrough(
+            new TransformStream({
+              transform: (chunk, controller) => {
+                this.renewActivityTimeout();
+                controller.enqueue(chunk);
+              },
+            })
+          ),
+          res
+        );
       }
 
-      this.decrementInflight();
       return res;
     } catch (e) {
       this.decrementInflight();

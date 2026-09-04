@@ -458,6 +458,47 @@ describe('Container', () => {
     expect(renewSpy).toHaveBeenCalled();
   });
 
+  test('an abandoned response body must not keep the container awake', async ({
+    mockCtx,
+    container,
+  }) => {
+    vi.useFakeTimers();
+    try {
+      container.sleepAfter = '1s';
+      mockCtx.container.running = true;
+      mockCtx.storage.get.mockResolvedValue({ status: 'healthy', lastChange: Date.now() });
+      mockCtx.container.getTcpPort.mockReturnValue({
+        fetch: vi.fn().mockResolvedValue({
+          status: 200,
+          webSocket: null,
+          headers: new Headers(),
+          // An endless body that the container keeps producing and nobody reads.
+          body: new ReadableStream({
+            pull(controller) {
+              controller.enqueue(new Uint8Array(1024));
+            },
+          }),
+        }),
+      });
+
+      const response = await container.containerFetch(new Request('https://example.com/big'));
+
+      // @ts-expect-error - inflightRequests is private
+      expect(container.inflightRequests).toBe(0);
+
+      vi.advanceTimersByTime(2_000);
+      // @ts-expect-error - isActivityExpired is private
+      expect(container.isActivityExpired()).toBe(true);
+
+      // Reading the body counts as activity again.
+      await response.body!.getReader().read();
+      // @ts-expect-error - isActivityExpired is private
+      expect(container.isActivityExpired()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test('containerFetch should create a WebSocket connection when requested', async ({
     mockCtx,
     container,
