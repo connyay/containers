@@ -37,6 +37,7 @@ const PING_TIMEOUT_MS = 5000;
 
 const DEFAULT_SLEEP_AFTER = '10m'; // Default sleep after inactivity time
 const INSTANCE_POLL_INTERVAL_MS = 300; // Default interval for polling container state
+const PROXY_BODY_READ_BYTES = 256 * 1024; // Buffer size for each read of a proxied response body
 
 // Timeout for getting container instance and launching a VM
 // Time to find an instance, attach a DO, call start, but NOT
@@ -1057,6 +1058,64 @@ export class Container<Env = Cloudflare.Env> extends DurableObject<Env> {
   }
 
   /**
+   * Forward a container response body to the client and renew the activity timeout as bytes move.
+   *
+   * The renewal needs to see the bytes, so the body has to pass through JavaScript, and that is
+   * where proxying gets expensive. A `TransformStream` with a transform callback hands JavaScript
+   * 4KB at a time. Reading with a BYOB reader into one reused buffer instead makes each trip a
+   * memcpy plus a promise, and the buffer size decides how many trips a body takes. The output
+   * side is an `IdentityTransformStream`, which the runtime pumps natively, so the bytes only
+   * cross into JavaScript once.
+   */
+  private proxyResponseBody(
+    body: ReadableStream<Uint8Array>,
+    headers: Headers
+  ): ReadableStream<Uint8Array> {
+    // Size the buffer to the body when its length is known, so a small reply does not allocate
+    // the full read buffer.
+    const contentLength = Number(headers.get('Content-Length'));
+    const bufferSize =
+      contentLength > 0 ? Math.min(contentLength, PROXY_BODY_READ_BYTES) : PROXY_BODY_READ_BYTES;
+    const { readable, writable } = new IdentityTransformStream();
+    void this.pumpResponseBody(body, writable, bufferSize);
+    return readable;
+  }
+
+  private async pumpResponseBody(
+    body: ReadableStream<Uint8Array>,
+    writable: WritableStream,
+    bufferSize: number
+  ) {
+    const writer = writable.getWriter();
+    const reader = body.getReader({ mode: 'byob' });
+    let buffer: ArrayBufferLike = new ArrayBuffer(bufferSize);
+
+    try {
+      for (;;) {
+        const { done, value }: ReadableStreamReadResult<Uint8Array> = await reader.read(
+          new Uint8Array(buffer)
+        );
+        if (done) {
+          break;
+        }
+        this.renewActivityTimeout();
+        // `IdentityTransformStream` resolves a write only once the client has taken the bytes, so
+        // a body nobody reads parks here without renewing anything, and the container can sleep.
+        await writer.write(value);
+        // A BYOB read detaches the buffer it was given and returns it as the result's backing
+        // store. Taking it back means one allocation for the whole body.
+        buffer = value.buffer;
+      }
+      await writer.close();
+    } catch (e) {
+      // Either side failing tears down the other. A client cancel errors the writable and rejects
+      // the pending write, and an error from the container rejects the read. Cancelling the source
+      // stops the container producing into a body nobody will receive.
+      await Promise.allSettled([writer.abort(e), reader.cancel(e)]);
+    }
+  }
+
+  /**
    * Decrement the inflight request counter.
    * When the counter transitions to 0, renew the activity timeout so the
    * inactivity window starts fresh from the moment the last request completes.
@@ -1310,17 +1369,7 @@ export class Container<Env = Cloudflare.Env> extends DurableObject<Env> {
       settleInflight();
 
       if (res.body !== null) {
-        return new Response(
-          res.body.pipeThrough(
-            new TransformStream({
-              transform: (chunk, controller) => {
-                this.renewActivityTimeout();
-                controller.enqueue(chunk);
-              },
-            })
-          ),
-          res
-        );
+        return new Response(this.proxyResponseBody(res.body, res.headers), res);
       }
 
       return res;

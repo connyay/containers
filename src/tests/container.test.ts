@@ -1,7 +1,8 @@
 import { describe, expect, test as baseTest, vi } from 'vitest';
 import { Container } from '../lib/container';
 import { getRandom } from '../lib/utils';
-import { MockWebSocket, test, webSocketPairSpy, type MockCtx } from './fixtures';
+import { setImmediate } from 'node:timers/promises';
+import { MockWebSocket, mockContainerBody, test, webSocketPairSpy, type MockCtx } from './fixtures';
 
 describe('Container', () => {
   test('should initialize with default values', ({ container }) => {
@@ -462,24 +463,23 @@ describe('Container', () => {
     mockCtx,
     container,
   }) => {
-    vi.useFakeTimers();
+    // Only freeze the clock: the pump moves bytes across real microtasks and setImmediate.
+    vi.useFakeTimers({ toFake: ['Date'] });
     try {
       container.sleepAfter = '1s';
       mockCtx.container.running = true;
       mockCtx.storage.get.mockResolvedValue({ status: 'healthy', lastChange: Date.now() });
-      mockCtx.container.getTcpPort.mockReturnValue({
-        fetch: vi.fn().mockResolvedValue({
-          status: 200,
-          webSocket: null,
-          headers: new Headers(),
-          // An endless body that the container keeps producing and nobody reads.
-          body: new ReadableStream({
-            pull(controller) {
-              controller.enqueue(new Uint8Array(1024));
-            },
-          }),
-        }),
-      });
+      // An endless body that the container keeps producing and nobody reads. Container bodies
+      // are byte streams, so the proxy can read them with a BYOB reader.
+      mockContainerBody(
+        mockCtx,
+        new ReadableStream({
+          type: 'bytes',
+          pull(controller) {
+            controller.enqueue(new Uint8Array(1024));
+          },
+        })
+      );
 
       const response = await container.containerFetch(new Request('https://example.com/big'));
 
@@ -492,11 +492,73 @@ describe('Container', () => {
 
       // Reading the body counts as activity again.
       await response.body!.getReader().read();
+      await setImmediate();
       // @ts-expect-error - isActivityExpired is private
       expect(container.isActivityExpired()).toBe(false);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  test('a proxied response body must arrive intact', async ({ mockCtx, container }) => {
+    mockCtx.container.running = true;
+    mockCtx.storage.get.mockResolvedValue({ status: 'healthy', lastChange: Date.now() });
+    // Three chunks: two that fit a read buffer and one larger than it, so the pump has to
+    // hand back a partial view and reuse its buffer.
+    const chunks = [
+      new Uint8Array(3).fill(1),
+      new Uint8Array(5).fill(2),
+      new Uint8Array(300 * 1024).fill(3),
+    ];
+    mockContainerBody(
+      mockCtx,
+      new ReadableStream({
+        type: 'bytes',
+        pull(controller) {
+          const chunk = chunks.shift();
+          if (chunk) {
+            controller.enqueue(chunk);
+          } else {
+            // Closing a byte source leaves a pending BYOB read hanging until it is answered.
+            controller.close();
+            controller.byobRequest?.respond(0);
+          }
+        },
+      })
+    );
+
+    const response = await container.containerFetch(new Request('https://example.com/file'));
+    const bytes = new Uint8Array(await response.arrayBuffer());
+
+    expect(bytes.byteLength).toBe(3 + 5 + 300 * 1024);
+    expect(bytes.subarray(0, 3)).toEqual(new Uint8Array(3).fill(1));
+    expect(bytes.subarray(3, 8)).toEqual(new Uint8Array(5).fill(2));
+    expect(bytes.subarray(8).every(b => b === 3)).toBe(true);
+  });
+
+  test('cancelling a proxied response body must cancel the container body', async ({
+    mockCtx,
+    container,
+  }) => {
+    mockCtx.container.running = true;
+    mockCtx.storage.get.mockResolvedValue({ status: 'healthy', lastChange: Date.now() });
+    const cancel = vi.fn();
+    mockContainerBody(
+      mockCtx,
+      new ReadableStream({
+        type: 'bytes',
+        pull(controller) {
+          controller.enqueue(new Uint8Array(1024));
+        },
+        cancel,
+      })
+    );
+
+    const response = await container.containerFetch(new Request('https://example.com/big'));
+    await response.body!.cancel('client went away');
+    await setImmediate();
+
+    expect(cancel).toHaveBeenCalledWith('client went away');
   });
 
   test('a client abort must release the in-flight count when the container never answers', async ({
