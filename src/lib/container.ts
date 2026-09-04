@@ -1214,6 +1214,28 @@ export class Container<Env = Cloudflare.Env> extends DurableObject<Env> {
 
     this.inflightRequests++;
 
+    // Whichever of these happens first releases the count, and the rest are no-ops: the container
+    // answers, the proxied fetch throws, the WebSocket closes or errors, the client aborts. More
+    // than one can fire. A WebSocket sends both close and error, and an abort can race the answer.
+    const { signal } = request;
+    let settled = false;
+    const settleInflight = () => {
+      if (!settled) {
+        settled = true;
+        signal.removeEventListener('abort', settleInflight);
+        this.decrementInflight();
+      }
+    };
+
+    // If the client disconnects and the proxied fetch never settles, this listener is the only
+    // thing that releases the count. The runtime only fires abort on an incoming request's signal
+    // when the `enable_request_signal` compatibility flag is on. Without it, this never runs.
+    if (signal.aborted) {
+      settleInflight();
+    } else {
+      signal.addEventListener('abort', settleInflight);
+    }
+
     try {
       // Renew the activity timeout whenever a request is proxied
       this.renewActivityTimeout();
@@ -1223,16 +1245,6 @@ export class Container<Env = Cloudflare.Env> extends DurableObject<Env> {
         // WebSocket response: proxy by accepting both sides and forwarding messages
         const containerWs = res.webSocket;
         const [client, server] = Object.values(new WebSocketPair()) as [WebSocket, WebSocket];
-
-        // Guard to ensure we only decrement inflight once per WebSocket,
-        // since both close and error events can fire.
-        let settled = false;
-        const settleInflight = () => {
-          if (!settled) {
-            settled = true;
-            this.decrementInflight();
-          }
-        };
 
         // Accept both WebSocket ends
         containerWs.accept();
@@ -1295,7 +1307,7 @@ export class Container<Env = Cloudflare.Env> extends DurableObject<Env> {
       // stream stalls on backpressure. Bytes flowing through the body renew the timeout below.
       // WebSockets keep the pin until close because the runtime guarantees a close/error event.
       // Body completion has no such guarantee.
-      this.decrementInflight();
+      settleInflight();
 
       if (res.body !== null) {
         return new Response(
@@ -1313,7 +1325,7 @@ export class Container<Env = Cloudflare.Env> extends DurableObject<Env> {
 
       return res;
     } catch (e) {
-      this.decrementInflight();
+      settleInflight();
 
       if (!(e instanceof Error)) {
         throw e;
